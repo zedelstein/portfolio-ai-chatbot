@@ -68,15 +68,10 @@ export async function POST(request: Request) {
   try {
     const { id, message, selectedChatModel, selectedVisibilityType } = requestBody;
     const session = await auth();
-    if (!session?.user) {
-      return new ChatSDKError('unauthorized:chat').toResponse();
-    }
+    if (!session?.user) return new ChatSDKError('unauthorized:chat').toResponse();
 
     const userType: UserType = session.user.type;
-    const messageCount = await getMessageCountByUserId({
-      id: session.user.id,
-      differenceInHours: 24,
-    });
+    const messageCount = await getMessageCountByUserId({ id: session.user.id, differenceInHours: 24 });
     if (messageCount > entitlementsByUserType[userType].maxMessagesPerDay) {
       return new ChatSDKError('rate_limit:chat').toResponse();
     }
@@ -89,13 +84,11 @@ export async function POST(request: Request) {
       return new ChatSDKError('forbidden:chat').toResponse();
     }
 
-    // Map DB messages to UI-friendly Message[]
+    // Convert DB messages to UI Message[]
     const rawMessages = await getMessagesByChatId({ id });
     const uiMessages: Message[] = rawMessages.map((m) => {
-      const allowedRoles: Message['role'][] = ['user', 'assistant', 'system', 'data'];
-      const role = allowedRoles.includes(m.role as Message['role'])
-        ? (m.role as Message['role'])
-        : 'user';
+      const roles: Message['role'][] = ['user', 'assistant', 'system', 'data'];
+      const role = roles.includes(m.role as Message['role']) ? (m.role as Message['role']) : 'user';
       return {
         id: m.id,
         role,
@@ -108,36 +101,22 @@ export async function POST(request: Request) {
     const { longitude, latitude, city, country } = geolocation(request);
     const requestHints: RequestHints = { longitude, latitude, city, country };
 
-    await saveMessages({
-      messages: [
-        {
-          id: message.id,
-          chatId: id,
-          role: 'user',
-          parts: message.parts,
-          attachments: message.experimental_attachments ?? [],
-          createdAt: new Date(),
-        },
-      ],
-    });
+    await saveMessages({ messages: [{ id: message.id, chatId: id, role: 'user', parts: message.parts, attachments: message.experimental_attachments ?? [], createdAt: new Date() }] });
 
     const streamId = generateUUID();
     await createStreamId({ streamId, chatId: id });
 
-    // Injected about-me text
+    // Build combined system prompt
     const manualText =
       'Zachary Edelstein – AI Consultant. 12 years of agency experience in digital marketing, data analytics, and SEO. Built and deployed RAG-powered chatbots using Next.js, LangChain, and Supabase. Expert in OpenAI APIs: embeddings, chat completions, fine-tuning. Developed marketing mix models and multi-touch attribution in Python. Skilled in project management, Agile, and stakeholder communication.';
+    const baseSystem = systemPrompt({ selectedChatModel, requestHints });
+    const combinedSystem = `${baseSystem}\n${manualText}`;
 
     const stream = createDataStream({
       execute: (dataStream) => {
-        const baseSystem = systemPrompt({ selectedChatModel, requestHints });
-        const fullSystem = [
-          { role: 'system', content: baseSystem },
-          { role: 'system', content: manualText },
-        ];
         const result = streamText({
           model: myProvider.languageModel(selectedChatModel),
-          system: fullSystem,
+          system: combinedSystem,
           messages,
           maxSteps: 5,
           experimental_activeTools:
@@ -155,23 +134,10 @@ export async function POST(request: Request) {
           onFinish: async ({ response }) => {
             if (!session.user?.id) return;
             try {
-              const assistantId = getTrailingMessageId({
-                messages: response.messages.filter((m) => m.role === 'assistant'),
-              });
+              const assistantId = getTrailingMessageId({ messages: response.messages.filter((m) => m.role === 'assistant') });
               if (!assistantId) throw new Error('No assistant message found!');
               const [, assistantMsg] = appendResponseMessages({ messages: [message], responseMessages: response.messages });
-              await saveMessages({
-                messages: [
-                  {
-                    id: assistantId,
-                    chatId: id,
-                    role: assistantMsg.role,
-                    parts: assistantMsg.parts,
-                    attachments: assistantMsg.experimental_attachments ?? [],
-                    createdAt: new Date(),
-                  },
-                ],
-              });
+              await saveMessages({ messages: [{ id: assistantId, chatId: id, role: assistantMsg.role, parts: assistantMsg.parts, attachments: assistantMsg.experimental_attachments ?? [], createdAt: new Date() }] });
             } catch {
               console.error('Failed to save chat');
             }
@@ -190,64 +156,41 @@ export async function POST(request: Request) {
     }
     return new Response(stream);
   } catch (error) {
-    if (error instanceof ChatSDKError) {
-      return error.toResponse();
-    }
+    if (error instanceof ChatSDKError) return error.toResponse();
   }
 }
 
 export async function GET(request: Request) {
   const streamContext = getStreamContext();
   const resumeRequestedAt = new Date();
-  if (!streamContext) {
-    return new Response(null, { status: 204 });
-  }
+  if (!streamContext) return new Response(null, { status: 204 });
 
   const { searchParams } = new URL(request.url);
   const chatId = searchParams.get('chatId');
-  if (!chatId) {
-    return new ChatSDKError('bad_request:api').toResponse();
-  }
+  if (!chatId) return new ChatSDKError('bad_request:api').toResponse();
 
   const session = await auth();
-  if (!session?.user) {
-    return new ChatSDKError('unauthorized:chat').toResponse();
-  }
+  if (!session?.user) return new ChatSDKError('unauthorized:chat').toResponse();
 
   let chat: Chat;
-  try {
-    chat = await getChatById({ id: chatId });
-  } catch {
-    return new ChatSDKError('not_found:chat').toResponse();
-  }
-  if (!chat) {
-    return new ChatSDKError('not_found:chat').toResponse();
-  }
-  if (chat.visibility === 'private' && chat.userId !== session.user.id) {
-    return new ChatSDKError('forbidden:chat').toResponse();
-  }
+  try { chat = await getChatById({ id: chatId }); } catch { return new ChatSDKError('not_found:chat').toResponse(); }
+  if (!chat) return new ChatSDKError('not_found:chat').toResponse();
+  if (chat.visibility === 'private' && chat.userId !== session.user.id) return new ChatSDKError('forbidden:chat').toResponse();
 
   const streamIds = await getStreamIdsByChatId({ chatId });
-  if (!streamIds.length) {
-    return new ChatSDKError('not_found:stream').toResponse();
-  }
-  const recentStreamId = streamIds.at(-1)!;
+  if (!streamIds.length) return new ChatSDKError('not_found:stream').toResponse();
+  const recentId = streamIds.at(-1)!;
+
   const emptyDataStream = createDataStream({ execute: () => {} });
-  const resumed = await streamContext.resumableStream(recentStreamId, () => emptyDataStream);
+  const resumed = await streamContext.resumableStream(recentId, () => emptyDataStream);
 
   if (!resumed) {
-    const messages = await getMessagesByChatId({ id: chatId });
-    const lastMsg = messages.at(-1);
-    if (!lastMsg || lastMsg.role !== 'assistant') {
-      return new Response(emptyDataStream, { status: 200 });
-    }
+    const msgs = await getMessagesByChatId({ id: chatId });
+    const lastMsg = msgs.at(-1);
+    if (!lastMsg || lastMsg.role !== 'assistant') return new Response(emptyDataStream, { status: 200 });
     const ageSec = differenceInSeconds(resumeRequestedAt, new Date(lastMsg.createdAt));
-    if (ageSec > 15) {
-      return new Response(emptyDataStream, { status: 200 });
-    }
-    const restored = createDataStream({ execute: (buffer) => {
-      buffer.writeData({ type: 'append-message', message: JSON.stringify(lastMsg) });
-    }});
+    if (ageSec > 15) return new Response(emptyDataStream, { status: 200 });
+    const restored = createDataStream({ execute: (buffer) => buffer.writeData({ type: 'append-message', message: JSON.stringify(lastMsg) }) });
     return new Response(restored, { status: 200 });
   }
   return new Response(resumed, { status: 200 });
@@ -256,17 +199,11 @@ export async function GET(request: Request) {
 export async function DELETE(request: Request) {
   const { searchParams } = new URL(request.url);
   const id = searchParams.get('id');
-  if (!id) {
-    return new ChatSDKError('bad_request:api').toResponse();
-  }
+  if (!id) return new ChatSDKError('bad_request:api').toResponse();
   const session = await auth();
-  if (!session?.user) {
-    return new ChatSDKError('unauthorized:chat').toResponse();
-  }
+  if (!session?.user) return new ChatSDKError('unauthorized:chat').toResponse();
   const chat = await getChatById({ id });
-  if (chat.userId !== session.user.id) {
-    return new ChatSDKError('forbidden:chat').toResponse();
-  }
-  const deletedChat = await deleteChatById({ id });
-  return Response.json(deletedChat, { status: 200 });
+  if (chat.userId !== session.user.id) return new ChatSDKError('forbidden:chat').toResponse();
+  const deleted = await deleteChatById({ id });
+  return Response.json(deleted, { status: 200 });
 }
