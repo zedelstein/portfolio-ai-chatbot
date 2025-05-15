@@ -68,7 +68,9 @@ export async function POST(request: Request) {
   try {
     const { id, message, selectedChatModel, selectedVisibilityType } = requestBody;
     const session = await auth();
-    if (!session?.user) return new ChatSDKError('unauthorized:chat').toResponse();
+    if (!session?.user) {
+      return new ChatSDKError('unauthorized:chat').toResponse();
+    }
 
     const userType: UserType = session.user.type;
     const messageCount = await getMessageCountByUserId({
@@ -90,8 +92,7 @@ export async function POST(request: Request) {
     // Map DB messages to UI-friendly Message[]
     const rawMessages = await getMessagesByChatId({ id });
     const uiMessages: Message[] = rawMessages.map((m) => {
-      // Ensure role matches allowed union type
-      const allowedRoles: Message['role'][] = ['user','assistant','system','data'];
+      const allowedRoles: Message['role'][] = ['user', 'assistant', 'system', 'data'];
       const role = allowedRoles.includes(m.role as Message['role'])
         ? (m.role as Message['role'])
         : 'user';
@@ -102,9 +103,8 @@ export async function POST(request: Request) {
         attachments: Array.isArray(m.attachments) ? m.attachments : [],
       };
     });
-
     const messages = appendClientMessage({ messages: uiMessages, message });
-    
+
     const { longitude, latitude, city, country } = geolocation(request);
     const requestHints: RequestHints = { longitude, latitude, city, country };
 
@@ -124,6 +124,7 @@ export async function POST(request: Request) {
     const streamId = generateUUID();
     await createStreamId({ streamId, chatId: id });
 
+    // Injected about-me text
     const manualText =
       'Zachary Edelstein – AI Consultant. 12 years of agency experience in digital marketing, data analytics, and SEO. Built and deployed RAG-powered chatbots using Next.js, LangChain, and Supabase. Expert in OpenAI APIs: embeddings, chat completions, fine-tuning. Developed marketing mix models and multi-touch attribution in Python. Skilled in project management, Agile, and stakeholder communication.';
 
@@ -134,7 +135,6 @@ export async function POST(request: Request) {
           { role: 'system', content: baseSystem },
           { role: 'system', content: manualText },
         ];
-
         const result = streamText({
           model: myProvider.languageModel(selectedChatModel),
           system: fullSystem,
@@ -159,7 +159,6 @@ export async function POST(request: Request) {
                 messages: response.messages.filter((m) => m.role === 'assistant'),
               });
               if (!assistantId) throw new Error('No assistant message found!');
-
               const [, assistantMsg] = appendResponseMessages({ messages: [message], responseMessages: response.messages });
               await saveMessages({
                 messages: [
@@ -179,7 +178,6 @@ export async function POST(request: Request) {
           },
           experimental_telemetry: { isEnabled: isProductionEnvironment, functionId: 'stream-text' },
         });
-
         result.consumeStream();
         result.mergeIntoDataStream(dataStream, { sendReasoning: true });
       },
@@ -192,40 +190,83 @@ export async function POST(request: Request) {
     }
     return new Response(stream);
   } catch (error) {
-    if (error instanceof ChatSDKError) return error.toResponse();
+    if (error instanceof ChatSDKError) {
+      return error.toResponse();
+    }
   }
 }
 
 export async function GET(request: Request) {
   const streamContext = getStreamContext();
   const resumeRequestedAt = new Date();
-  if (!streamContext) return new Response(null, { status: 204 });
+  if (!streamContext) {
+    return new Response(null, { status: 204 });
+  }
 
   const { searchParams } = new URL(request.url);
   const chatId = searchParams.get('chatId');
-  if (!chatId) return new ChatSDKError('bad_request:api').toResponse();
+  if (!chatId) {
+    return new ChatSDKError('bad_request:api').toResponse();
+  }
 
   const session = await auth();
-  if (!session?.user) return new ChatSDKError('unauthorized:chat').toResponse();
+  if (!session?.user) {
+    return new ChatSDKError('unauthorized:chat').toResponse();
+  }
 
   let chat: Chat;
-  try { chat = await getChatById({ id: chatId }); }
-  catch { return new ChatSDKError('not_found:chat').toResponse(); }
-
-  if (!chat) return new ChatSDKError('not_found:chat').toResponse();
+  try {
+    chat = await getChatById({ id: chatId });
+  } catch {
+    return new ChatSDKError('not_found:chat').toResponse();
+  }
+  if (!chat) {
+    return new ChatSDKError('not_found:chat').toResponse();
+  }
   if (chat.visibility === 'private' && chat.userId !== session.user.id) {
     return new ChatSDKError('forbidden:chat').toResponse();
   }
 
   const streamIds = await getStreamIdsByChatId({ chatId });
-  if (!streamIds.length) return new ChatSDKError('not_found:stream').toResponse();
-
+  if (!streamIds.length) {
+    return new ChatSDKError('not_found:stream').toResponse();
+  }
   const recentStreamId = streamIds.at(-1)!;
   const emptyDataStream = createDataStream({ execute: () => {} });
-  const stream = await streamContext.resumableStream(recentStreamId, () => emptyDataStream);
+  const resumed = await streamContext.resumableStream(recentStreamId, () => emptyDataStream);
 
-  if (!stream) {
+  if (!resumed) {
     const messages = await getMessagesByChatId({ id: chatId });
     const lastMsg = messages.at(-1);
     if (!lastMsg || lastMsg.role !== 'assistant') {
       return new Response(emptyDataStream, { status: 200 });
+    }
+    const ageSec = differenceInSeconds(resumeRequestedAt, new Date(lastMsg.createdAt));
+    if (ageSec > 15) {
+      return new Response(emptyDataStream, { status: 200 });
+    }
+    const restored = createDataStream({ execute: (buffer) => {
+      buffer.writeData({ type: 'append-message', message: JSON.stringify(lastMsg) });
+    }});
+    return new Response(restored, { status: 200 });
+  }
+  return new Response(resumed, { status: 200 });
+}
+
+export async function DELETE(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const id = searchParams.get('id');
+  if (!id) {
+    return new ChatSDKError('bad_request:api').toResponse();
+  }
+  const session = await auth();
+  if (!session?.user) {
+    return new ChatSDKError('unauthorized:chat').toResponse();
+  }
+  const chat = await getChatById({ id });
+  if (chat.userId !== session.user.id) {
+    return new ChatSDKError('forbidden:chat').toResponse();
+  }
+  const deletedChat = await deleteChatById({ id });
+  return Response.json(deletedChat, { status: 200 });
+}
