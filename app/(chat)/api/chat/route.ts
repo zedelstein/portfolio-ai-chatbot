@@ -38,32 +38,25 @@ import { differenceInSeconds } from 'date-fns';
 import { ChatSDKError } from '@/lib/errors';
 
 export const maxDuration = 60;
-
 let globalStreamContext: ResumableStreamContext | null = null;
 
 function getStreamContext() {
   if (!globalStreamContext) {
     try {
-      globalStreamContext = createResumableStreamContext({
-        waitUntil: after,
-      });
+      globalStreamContext = createResumableStreamContext({ waitUntil: after });
     } catch (error: any) {
       if (error.message.includes('REDIS_URL')) {
-        console.log(
-          ' > Resumable streams are disabled due to missing REDIS_URL',
-        );
+        console.log(' > Resumable streams are disabled due to missing REDIS_URL');
       } else {
         console.error(error);
       }
     }
   }
-
   return globalStreamContext;
 }
 
 export async function POST(request: Request) {
   let requestBody: PostRequestBody;
-
   try {
     const json = await request.json();
     requestBody = postRequestBodySchema.parse(json);
@@ -72,61 +65,32 @@ export async function POST(request: Request) {
   }
 
   try {
-    const { id, message, selectedChatModel, selectedVisibilityType } =
-      requestBody;
-
+    const { id, message, selectedChatModel, selectedVisibilityType } = requestBody;
     const session = await auth();
-
-    if (!session?.user) {
-      return new ChatSDKError('unauthorized:chat').toResponse();
-    }
+    if (!session?.user) return new ChatSDKError('unauthorized:chat').toResponse();
 
     const userType: UserType = session.user.type;
-
     const messageCount = await getMessageCountByUserId({
       id: session.user.id,
       differenceInHours: 24,
     });
-
     if (messageCount > entitlementsByUserType[userType].maxMessagesPerDay) {
       return new ChatSDKError('rate_limit:chat').toResponse();
     }
 
     const chat = await getChatById({ id });
-
     if (!chat) {
-      const title = await generateTitleFromUserMessage({
-        message,
-      });
-
-      await saveChat({
-        id,
-        userId: session.user.id,
-        title,
-        visibility: selectedVisibilityType,
-      });
-    } else {
-      if (chat.userId !== session.user.id) {
-        return new ChatSDKError('forbidden:chat').toResponse();
-      }
+      const title = await generateTitleFromUserMessage({ message });
+      await saveChat({ id, userId: session.user.id, title, visibility: selectedVisibilityType });
+    } else if (chat.userId !== session.user.id) {
+      return new ChatSDKError('forbidden:chat').toResponse();
     }
 
     const previousMessages = await getMessagesByChatId({ id });
-
-    const messages = appendClientMessage({
-      // @ts-expect-error: todo add type conversion from DBMessage[] to UIMessage[]
-      messages: previousMessages,
-      message,
-    });
+    const messages = appendClientMessage({ messages: previousMessages, message });
 
     const { longitude, latitude, city, country } = geolocation(request);
-
-    const requestHints: RequestHints = {
-      longitude,
-      latitude,
-      city,
-      country,
-    };
+    const requestHints: RequestHints = { longitude, latitude, city, country };
 
     await saveMessages({
       messages: [
@@ -144,194 +108,110 @@ export async function POST(request: Request) {
     const streamId = generateUUID();
     await createStreamId({ streamId, chatId: id });
 
-    // --- New: Manually injected document text ---
-    const manualText = 'Zachary Edelstein – AI Consultant. 12 years of agency experience in digital marketing, data analytics, and SEO. Built and deployed RAG-powered chatbots using Next.js, LangChain, and Supabase. Expert in OpenAI APIs: embeddings, chat completions, fine-tuning. Developed marketing mix models and multi-touch attribution in Python. Skilled in project management, Agile, and stakeholder communication.';
+    // --- About-me text injected here ---
+    const manualText =
+      'Zachary Edelstein – AI Consultant. 12 years of agency experience in digital marketing, data analytics, and SEO. Built and deployed RAG-powered chatbots using Next.js, LangChain, and Supabase. Expert in OpenAI APIs: embeddings, chat completions, fine-tuning. Developed marketing mix models and multi-touch attribution in Python. Skilled in project management, Agile, and stakeholder communication.';
 
     const stream = createDataStream({
       execute: (dataStream) => {
+        // Build base system message
+        const baseSystem = systemPrompt({ selectedChatModel, requestHints });
+        // Inject about-me as a second system instruction
+        const fullSystem = [
+          { role: 'system', content: baseSystem },
+          { role: 'system', content: manualText },
+        ];
+
         const result = streamText({
           model: myProvider.languageModel(selectedChatModel),
-          system: systemPrompt({ selectedChatModel, requestHints }),
+          system: fullSystem,
           messages,
           maxSteps: 5,
           experimental_activeTools:
             selectedChatModel === 'chat-model-reasoning'
               ? []
-              : [
-                  'getWeather',
-                  'createDocument',
-                  'updateDocument',
-                  'requestSuggestions',
-                ],
+              : ['getWeather', 'createDocument', 'updateDocument', 'requestSuggestions'],
           experimental_transform: smoothStream({ chunking: 'word' }),
           experimental_generateMessageId: generateUUID,
           tools: {
             getWeather,
             createDocument: createDocument({ session, dataStream }),
             updateDocument: updateDocument({ session, dataStream }),
-            requestSuggestions: requestSuggestions({
-              session,
-              dataStream,
-            }),
+            requestSuggestions: requestSuggestions({ session, dataStream }),
           },
           onFinish: async ({ response }) => {
-            if (session.user?.id) {
-              try {
-                const assistantId = getTrailingMessageId({
-                  messages: response.messages.filter(
-                    (message) => message.role === 'assistant',
-                  ),
-                });
+            if (!session.user?.id) return;
+            try {
+              const assistantId = getTrailingMessageId({
+                messages: response.messages.filter((m) => m.role === 'assistant'),
+              });
+              if (!assistantId) throw new Error('No assistant message found!');
 
-                if (!assistantId) {
-                  throw new Error('No assistant message found!');
-                }
-
-                const [, assistantMessage] = appendResponseMessages({
-                  messages: [message],
-                  responseMessages: response.messages,
-                });
-
-                await saveMessages({
-                  messages: [
-                    {
-                      id: assistantId,
-                      chatId: id,
-                      role: assistantMessage.role,
-                      parts: assistantMessage.parts,
-                      attachments:
-                        assistantMessage.experimental_attachments ?? [],
-                      createdAt: new Date(),
-                    },
-                  ],
-                });
-              } catch (_) {
-                console.error('Failed to save chat');
-              }
+              const [, assistantMsg] = appendResponseMessages({ messages: [message], responseMessages: response.messages });
+              await saveMessages({ messages: [{ id: assistantId, chatId: id, role: assistantMsg.role, parts: assistantMsg.parts, attachments: assistantMsg.experimental_attachments ?? [], createdAt: new Date() }] });
+            } catch {
+              console.error('Failed to save chat');
             }
           },
-          experimental_telemetry: {
-            isEnabled: isProductionEnvironment,
-            functionId: 'stream-text',
-          },
+          experimental_telemetry: { isEnabled: isProductionEnvironment, functionId: 'stream-text' },
         });
 
         result.consumeStream();
-
-        result.mergeIntoDataStream(dataStream, {
-          sendReasoning: true,
-        });
+        result.mergeIntoDataStream(dataStream, { sendReasoning: true });
       },
-      onError: () => {
-        return 'Oops, an error occurred!';
-      },
+      onError: () => 'Oops, an error occurred!',
     });
 
     const streamContext = getStreamContext();
-
     if (streamContext) {
-      return new Response(
-        await streamContext.resumableStream(streamId, () => stream),
-      );
-    } else {
-      return new Response(stream);
+      return new Response(await streamContext.resumableStream(streamId, () => stream));
     }
+    return new Response(stream);
   } catch (error) {
-    if (error instanceof ChatSDKError) {
-      return error.toResponse();
-    }
+    if (error instanceof ChatSDKError) return error.toResponse();
   }
 }
 
 export async function GET(request: Request) {
   const streamContext = getStreamContext();
   const resumeRequestedAt = new Date();
-
-  if (!streamContext) {
-    return new Response(null, { status: 204 });
-  }
+  if (!streamContext) return new Response(null, { status: 204 });
 
   const { searchParams } = new URL(request.url);
   const chatId = searchParams.get('chatId');
-
-  if (!chatId) {
-    return new ChatSDKError('bad_request:api').toResponse();
-  }
+  if (!chatId) return new ChatSDKError('bad_request:api').toResponse();
 
   const session = await auth();
-
-  if (!session?.user) {
-    return new ChatSDKError('unauthorized:chat').toResponse();
-  }
+  if (!session?.user) return new ChatSDKError('unauthorized:chat').toResponse();
 
   let chat: Chat;
+  try { chat = await getChatById({ id: chatId }); }
+  catch { return new ChatSDKError('not_found:chat').toResponse(); }
 
-  try {
-    chat = await getChatById({ id: chatId });
-  } catch {
-    return new ChatSDKError('not_found:chat').toResponse();
-  }
-
-  if (!chat) {
-    return new ChatSDKError('not_found:chat').toResponse();
-  }
-
+  if (!chat) return new ChatSDKError('not_found:chat').toResponse();
   if (chat.visibility === 'private' && chat.userId !== session.user.id) {
     return new ChatSDKError('forbidden:chat').toResponse();
   }
 
   const streamIds = await getStreamIdsByChatId({ chatId });
+  if (!streamIds.length) return new ChatSDKError('not_found:stream').toResponse();
 
-  if (!streamIds.length) {
-    return new ChatSDKError('not_found:stream').toResponse();
-  }
+  const recentStreamId = streamIds.at(-1)!;
+  const emptyDataStream = createDataStream({ execute: () => {} });
+  const stream = await streamContext.resumableStream(recentStreamId, () => emptyDataStream);
 
-  const recentStreamId = streamIds.at(-1);
-
-  if (!recentStreamId) {
-    return new ChatSDKError('not_found:stream').toResponse();
-  }
-
-  const emptyDataStream = createDataStream({
-    execute: () => {},
-  });
-
-  const stream = await streamContext.resumableStream(
-    recentStreamId,
-    () => emptyDataStream,
-  );
-
-  /*
-   * For when the generation is streaming during SSR
-   * but the resumable stream has concluded at this point.
-   */
   if (!stream) {
     const messages = await getMessagesByChatId({ id: chatId });
-    const mostRecentMessage = messages.at(-1);
-
-    if (!mostRecentMessage) {
+    const lastMsg = messages.at(-1);
+    if (!lastMsg || lastMsg.role !== 'assistant') {
       return new Response(emptyDataStream, { status: 200 });
     }
+    const ageSec = differenceInSeconds(resumeRequestedAt, new Date(lastMsg.createdAt));
+    if (ageSec > 15) return new Response(emptyDataStream, { status: 200 });
 
-    if (mostRecentMessage.role !== 'assistant') {
-      return new Response(emptyDataStream, { status: 200 });
-    }
-
-    const messageCreatedAt = new Date(mostRecentMessage.createdAt);
-
-    if (differenceInSeconds(resumeRequestedAt, messageCreatedAt) > 15) {
-      return new Response(emptyDataStream, { status: 200 });
-    }
-
-    const restoredStream = createDataStream({
-      execute: (buffer) => {
-        buffer.writeData({
-          type: 'append-message',
-          message: JSON.stringify(mostRecentMessage),
-        });
-      },
-    });
-
+    const restoredStream = createDataStream({ execute: (buffer) => {
+      buffer.writeData({ type: 'append-message', message: JSON.stringify(lastMsg) });
+    }});
     return new Response(restoredStream, { status: 200 });
   }
 
@@ -341,24 +221,14 @@ export async function GET(request: Request) {
 export async function DELETE(request: Request) {
   const { searchParams } = new URL(request.url);
   const id = searchParams.get('id');
-
-  if (!id) {
-    return new ChatSDKError('bad_request:api').toResponse();
-  }
+  if (!id) return new ChatSDKError('bad_request:api').toResponse();
 
   const session = await auth();
-
-  if (!session?.user) {
-    return new ChatSDKError('unauthorized:chat').toResponse();
-  }
+  if (!session?.user) return new ChatSDKError('unauthorized:chat').toResponse();
 
   const chat = await getChatById({ id });
-
-  if (chat.userId !== session.user.id) {
-    return new ChatSDKError('forbidden:chat').toResponse();
-  }
+  if (chat.userId !== session.user.id) return new ChatSDKError('forbidden:chat').toResponse();
 
   const deletedChat = await deleteChatById({ id });
-
   return Response.json(deletedChat, { status: 200 });
 }
