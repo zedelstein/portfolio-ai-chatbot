@@ -86,8 +86,16 @@ export async function POST(request: Request) {
       return new ChatSDKError('forbidden:chat').toResponse();
     }
 
-    const previousMessages = await getMessagesByChatId({ id });
-    const messages = appendClientMessage({ messages: previousMessages, message });
+    // Fetch and convert stored messages to UI-friendly format
+    const rawMessages = await getMessagesByChatId({ id });
+    const uiMessages = rawMessages.map((m) => ({
+      id: m.id,
+      role: m.role,
+      content: Array.isArray(m.parts) ? m.parts.join('') : String(m.parts),
+      attachments: Array.isArray(m.attachments) ? m.attachments : [],
+    }));
+
+    const messages = appendClientMessage({ messages: uiMessages, message });
 
     const { longitude, latitude, city, country } = geolocation(request);
     const requestHints: RequestHints = { longitude, latitude, city, country };
@@ -95,8 +103,8 @@ export async function POST(request: Request) {
     await saveMessages({
       messages: [
         {
-          chatId: id,
           id: message.id,
+          chatId: id,
           role: 'user',
           parts: message.parts,
           attachments: message.experimental_attachments ?? [],
@@ -108,15 +116,13 @@ export async function POST(request: Request) {
     const streamId = generateUUID();
     await createStreamId({ streamId, chatId: id });
 
-    // --- About-me text injected here ---
+    // About-me injection
     const manualText =
       'Zachary Edelstein – AI Consultant. 12 years of agency experience in digital marketing, data analytics, and SEO. Built and deployed RAG-powered chatbots using Next.js, LangChain, and Supabase. Expert in OpenAI APIs: embeddings, chat completions, fine-tuning. Developed marketing mix models and multi-touch attribution in Python. Skilled in project management, Agile, and stakeholder communication.';
 
     const stream = createDataStream({
       execute: (dataStream) => {
-        // Build base system message
         const baseSystem = systemPrompt({ selectedChatModel, requestHints });
-        // Inject about-me as a second system instruction
         const fullSystem = [
           { role: 'system', content: baseSystem },
           { role: 'system', content: manualText },
@@ -148,7 +154,18 @@ export async function POST(request: Request) {
               if (!assistantId) throw new Error('No assistant message found!');
 
               const [, assistantMsg] = appendResponseMessages({ messages: [message], responseMessages: response.messages });
-              await saveMessages({ messages: [{ id: assistantId, chatId: id, role: assistantMsg.role, parts: assistantMsg.parts, attachments: assistantMsg.experimental_attachments ?? [], createdAt: new Date() }] });
+              await saveMessages({
+                messages: [
+                  {
+                    id: assistantId,
+                    chatId: id,
+                    role: assistantMsg.role,
+                    parts: assistantMsg.parts,
+                    attachments: assistantMsg.experimental_attachments ?? [],
+                    createdAt: new Date(),
+                  },
+                ],
+              });
             } catch {
               console.error('Failed to save chat');
             }
