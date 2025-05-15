@@ -227,33 +227,6 @@ export async function POST(request: Request) {
       },
     });
 
-    ${manualText}',
-          messages,
-          maxSteps: 5,
-          experimental_activeTools:
-            selectedChatModel === 'chat-model-reasoning'
-              ? []
-              : ['getWeather','createDocument','updateDocument','requestSuggestions'],
-          tools: {
-            getWeather,
-            createDocument: createDocument({ session, dataStream }),
-            updateDocument: updateDocument({ session, dataStream }),
-            requestSuggestions: requestSuggestions({ session, dataStream }),
-          },
-          experimental_transform: smoothStream({ chunking: 'word' }),
-          experimental_generateMessageId: generateUUID,
-          onFinish: async ({ response }) => {
-            // Save assistant response (unchanged)...
-          },
-          experimental_telemetry: { isEnabled: isProductionEnvironment, functionId: 'stream-text' },
-        });
-
-        result.consumeStream();
-        result.mergeIntoDataStream(dataStream, { sendReasoning: true });
-      },
-      onError: () => 'Oops, an error occurred!',
-    });
-
     const streamContext = getStreamContext();
 
     if (streamContext) {
