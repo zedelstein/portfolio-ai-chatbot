@@ -4,6 +4,7 @@ import {
   createDataStream,
   smoothStream,
   streamText,
+  Message,
 } from 'ai';
 import { auth, type UserType } from '@/app/(auth)/auth';
 import { type RequestHints, systemPrompt } from '@/lib/ai/prompts';
@@ -86,17 +87,24 @@ export async function POST(request: Request) {
       return new ChatSDKError('forbidden:chat').toResponse();
     }
 
-    // Fetch and convert stored messages to UI-friendly format
+    // Map DB messages to UI-friendly Message[]
     const rawMessages = await getMessagesByChatId({ id });
-    const uiMessages = rawMessages.map((m) => ({
-      id: m.id,
-      role: m.role,
-      content: Array.isArray(m.parts) ? m.parts.join('') : String(m.parts),
-      attachments: Array.isArray(m.attachments) ? m.attachments : [],
-    }));
+    const uiMessages: Message[] = rawMessages.map((m) => {
+      // Ensure role matches allowed union type
+      const allowedRoles: Message['role'][] = ['user','assistant','system','data'];
+      const role = allowedRoles.includes(m.role as Message['role'])
+        ? (m.role as Message['role'])
+        : 'user';
+      return {
+        id: m.id,
+        role,
+        content: Array.isArray(m.parts) ? m.parts.join('') : String(m.parts),
+        attachments: Array.isArray(m.attachments) ? m.attachments : [],
+      };
+    });
 
     const messages = appendClientMessage({ messages: uiMessages, message });
-
+    
     const { longitude, latitude, city, country } = geolocation(request);
     const requestHints: RequestHints = { longitude, latitude, city, country };
 
@@ -116,7 +124,6 @@ export async function POST(request: Request) {
     const streamId = generateUUID();
     await createStreamId({ streamId, chatId: id });
 
-    // About-me injection
     const manualText =
       'Zachary Edelstein – AI Consultant. 12 years of agency experience in digital marketing, data analytics, and SEO. Built and deployed RAG-powered chatbots using Next.js, LangChain, and Supabase. Expert in OpenAI APIs: embeddings, chat completions, fine-tuning. Developed marketing mix models and multi-touch attribution in Python. Skilled in project management, Agile, and stakeholder communication.';
 
@@ -222,30 +229,3 @@ export async function GET(request: Request) {
     const lastMsg = messages.at(-1);
     if (!lastMsg || lastMsg.role !== 'assistant') {
       return new Response(emptyDataStream, { status: 200 });
-    }
-    const ageSec = differenceInSeconds(resumeRequestedAt, new Date(lastMsg.createdAt));
-    if (ageSec > 15) return new Response(emptyDataStream, { status: 200 });
-
-    const restoredStream = createDataStream({ execute: (buffer) => {
-      buffer.writeData({ type: 'append-message', message: JSON.stringify(lastMsg) });
-    }});
-    return new Response(restoredStream, { status: 200 });
-  }
-
-  return new Response(stream, { status: 200 });
-}
-
-export async function DELETE(request: Request) {
-  const { searchParams } = new URL(request.url);
-  const id = searchParams.get('id');
-  if (!id) return new ChatSDKError('bad_request:api').toResponse();
-
-  const session = await auth();
-  if (!session?.user) return new ChatSDKError('unauthorized:chat').toResponse();
-
-  const chat = await getChatById({ id });
-  if (chat.userId !== session.user.id) return new ChatSDKError('forbidden:chat').toResponse();
-
-  const deletedChat = await deleteChatById({ id });
-  return Response.json(deletedChat, { status: 200 });
-}
