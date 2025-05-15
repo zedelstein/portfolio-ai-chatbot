@@ -13,7 +13,7 @@ export const Greeting = () => {
         transition={{ delay: 0.5 }}
         className="text-2xl font-semibold"
       >
-        Hello there!
+        Welcome to Zach's portfolio chatbot!
       </motion.div>
       <motion.div
         initial={{ opacity: 0, y: 10 }}
@@ -22,7 +22,7 @@ export const Greeting = () => {
         transition={{ delay: 0.6 }}
         className="text-2xl text-zinc-500"
       >
-        How can I help you today?
+        What would you like to know about Zach? Ask me about his work experience, past achievements, education and more. I can also generate a resume PDF for you. 
       </motion.div>
     </div>
   );
