@@ -144,6 +144,9 @@ export async function POST(request: Request) {
     const streamId = generateUUID();
     await createStreamId({ streamId, chatId: id });
 
+    // --- New: Manually injected document text ---
+    const manualText = 'Zachary Edelstein – AI Consultant. 12 years of agency experience in digital marketing, data analytics, and SEO. Built and deployed RAG-powered chatbots using Next.js, LangChain, and Supabase. Expert in OpenAI APIs: embeddings, chat completions, fine-tuning. Developed marketing mix models and multi-touch attribution in Python. Skilled in project management, Agile, and stakeholder communication.';
+
     const stream = createDataStream({
       execute: (dataStream) => {
         const result = streamText({
